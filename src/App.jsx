@@ -7,6 +7,7 @@ const COLORS = ["#c8a96e", "#7eb8a0", "#e07878", "#78a8e0", "#d4a050"];
 const uid = () => (crypto?.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 const money = (n) => `${Math.round(Number.isFinite(n) ? n : 0).toLocaleString()}원`;
 const pct = (n) => `${Number.isFinite(n) ? n.toFixed(1) : "0.0"}%`;
+const roundUpTo = (value, unit = 100) => Math.ceil(num(value) / unit) * unit;
 const num = (v, fallback = 0) => {
   const next = Number(v);
   return Number.isFinite(next) ? next : fallback;
@@ -26,6 +27,20 @@ const defaultBean = (overrides = {}) => ({
   ...overrides,
 });
 
+const defaultCostTargets = () => [
+  { id: uid(), channel: "도매", sizeKg: 1, targetCostRate: 60 },
+  { id: uid(), channel: "소매", sizeKg: 0.2, targetCostRate: 35 },
+  { id: uid(), channel: "소매", sizeKg: 0.5, targetCostRate: 40 },
+  { id: uid(), channel: "소매", sizeKg: 1, targetCostRate: 45 },
+];
+
+const normalizeCostTarget = (item = {}) => ({
+  id: uid(),
+  channel: String(item.channel || "소매"),
+  sizeKg: clamp(item.sizeKg ?? item.size ?? 1, 0.01, 999),
+  targetCostRate: clamp(item.targetCostRate ?? item.costRate ?? 45, 1, 99),
+});
+
 const normalizeBean = (bean = {}) =>
   defaultBean({
     id: uid(),
@@ -39,8 +54,12 @@ const normalizeSaved = (item = {}) => ({
   name: String(item.name || `블렌드 ${todayStr()}`),
   savedAt: String(item.savedAt || new Date().toLocaleString("ko-KR")),
   beans: Array.isArray(item.beans) && item.beans.length ? item.beans.map(normalizeBean) : [defaultBean()],
+  pricingMode: item.pricingMode === "costRate" ? "costRate" : "margin",
   roastLoss: clamp(item.roastLoss ?? item.lossRate ?? 18, 0, 80),
   targetMargin: clamp(item.targetMargin ?? 55, 0, 95),
+  packagingPerKg: clamp(item.packagingPerKg ?? 0, 0, 9999999),
+  costTargets: Array.isArray(item.costTargets) && item.costTargets.length ? item.costTargets.map(normalizeCostTarget) : defaultCostTargets(),
+  activeCostTargetId: item.activeCostTargetId || "",
   sellPriceInput: item.sellPriceInput ? String(item.sellPriceInput) : "",
   monthlyMode: item.monthlyMode === "revenue" ? "revenue" : "kg",
   monthlyKg: clamp(item.monthlyKg ?? 30, 0, 999999),
@@ -93,7 +112,11 @@ export default function App() {
     defaultBean({ id: "bean-2", name: "브라질 세하도", pricePerKg: 10000, ratio: 50 }),
   ]);
   const [roastLoss, setRoastLoss] = useState(18);
+  const [pricingMode, setPricingMode] = useState("margin");
   const [targetMargin, setTargetMargin] = useState(55);
+  const [packagingPerKg, setPackagingPerKg] = useState(0);
+  const [costTargets, setCostTargets] = useState(defaultCostTargets);
+  const [activeCostTargetId, setActiveCostTargetId] = useState("");
   const [sellPriceInput, setSellPriceInput] = useState("");
   const [monthlyMode, setMonthlyMode] = useState("kg");
   const [monthlyKg, setMonthlyKg] = useState(30);
@@ -121,6 +144,19 @@ export default function App() {
   const updateBean = (id, patch) => setBeans((list) => list.map((b) => (b.id === id ? { ...b, ...patch } : b)));
   const addBean = () => setBeans((list) => [...list, defaultBean()]);
   const removeBean = (id) => setBeans((list) => (list.length > 1 ? list.filter((b) => b.id !== id) : list));
+  const updateCostTarget = (id, patch) => setCostTargets((list) => list.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+  const addCostTarget = () =>
+    setCostTargets((list) => {
+      const item = { id: uid(), channel: "소매", sizeKg: 0.2, targetCostRate: 40 };
+      if (!activeCostTargetId) setActiveCostTargetId(item.id);
+      return [...list, item];
+    });
+  const removeCostTarget = (id) =>
+    setCostTargets((list) => {
+      const next = list.length > 1 ? list.filter((item) => item.id !== id) : list;
+      if (activeCostTargetId === id) setActiveCostTargetId(next[0]?.id || "");
+      return next;
+    });
   const updateFixedCost = (key, value) => setFixedCosts((prev) => ({ ...prev, [key]: inputNumber(value, 0, 999999999) }));
   const autoFill = () => {
     if (!canAutoFill) return showToast("마지막 생두를 제외한 합계가 100%를 넘었습니다.", "err");
@@ -138,29 +174,65 @@ export default function App() {
     const monthlySalesRevenue = num(monthlyRevenue);
     const variableCostPerKg = num(variablePerKg);
     const feeRate = num(salesFeeRate);
+    const packagingCostPerKg = num(packagingPerKg);
     const fixedTotal = num(fixedCosts.labor) + num(fixedCosts.rent) + num(fixedCosts.other);
     const greenCostPerKg = beans.reduce((sum, b) => sum + num(b.pricePerKg) * ((Number(b.ratio) || 0) / totalRatio), 0);
     const roastedCostPerKg = greenCostPerKg / Math.max(0.05, 1 - lossRate / 100);
-    const recommendedPrice = marginRate < 95 ? roastedCostPerKg / (1 - marginRate / 100) : 0;
+    const pricingCostPerKg = roastedCostPerKg + packagingCostPerKg;
+    const costRateRows = costTargets.map((target) => {
+      const sizeKg = num(target.sizeKg, 1);
+      const targetRate = num(target.targetCostRate, 1);
+      const calculatedPrice = targetRate > 0 ? (pricingCostPerKg * sizeKg) / (targetRate / 100) : 0;
+      const recommended = roundUpTo(calculatedPrice, 100);
+      const cost = pricingCostPerKg * sizeKg;
+      return {
+        ...target,
+        sizeKg,
+        targetCostRate: targetRate,
+        calculatedPrice,
+        recommended,
+        per100g: sizeKg > 0 ? recommended / (sizeKg * 10) : 0,
+        cost,
+        actualCostRate: recommended > 0 ? (cost / recommended) * 100 : 0,
+        marginRate: recommended > 0 ? ((recommended - cost) / recommended) * 100 : 0,
+        marginAmount: recommended - cost,
+      };
+    });
+    const activeCostTarget =
+      costRateRows.find((target) => target.id === activeCostTargetId) ||
+      costRateRows.find((target) => target.channel.includes("소매") && Math.abs(target.sizeKg - 1) < 0.001) ||
+      costRateRows.find((target) => Math.abs(target.sizeKg - 1) < 0.001) ||
+      costRateRows[0];
+    const recommendedPrice =
+      pricingMode === "costRate"
+        ? activeCostTarget?.sizeKg > 0
+          ? activeCostTarget.recommended / activeCostTarget.sizeKg
+          : 0
+        : marginRate < 95
+          ? roastedCostPerKg / (1 - marginRate / 100)
+          : 0;
     const sellPricePerKg = Number(sellPriceInput) > 0 ? Number(sellPriceInput) : recommendedPrice;
-    const grossProfitPerKg = sellPricePerKg - roastedCostPerKg;
+    const grossProfitPerKg = sellPricePerKg - pricingCostPerKg;
     const grossMargin = sellPricePerKg > 0 ? (grossProfitPerKg / sellPricePerKg) * 100 : 0;
 
     const soldKg = monthlyMode === "kg" ? monthlySalesKg : sellPricePerKg > 0 ? monthlySalesRevenue / sellPricePerKg : 0;
     const revenue = monthlyMode === "kg" ? soldKg * sellPricePerKg : monthlySalesRevenue;
-    const beanCostTotal = roastedCostPerKg * soldKg;
+    const beanCostTotal = pricingCostPerKg * soldKg;
     const grossProfit = revenue - beanCostTotal;
     const variableCost = variableCostPerKg * soldKg + revenue * (feeRate / 100);
     const contributionProfit = grossProfit - variableCost;
     const operatingProfit = contributionProfit - fixedTotal;
     const operatingMargin = revenue > 0 ? (operatingProfit / revenue) * 100 : 0;
-    const contributionPerKg = sellPricePerKg - roastedCostPerKg - variableCostPerKg - sellPricePerKg * (feeRate / 100);
+    const contributionPerKg = sellPricePerKg - pricingCostPerKg - variableCostPerKg - sellPricePerKg * (feeRate / 100);
     const breakEvenKg = contributionPerKg > 0 ? fixedTotal / contributionPerKg : 0;
     const breakEvenRevenue = breakEvenKg * sellPricePerKg;
 
     return {
       greenCostPerKg,
       roastedCostPerKg,
+      pricingCostPerKg,
+      costRateRows,
+      activeCostTarget,
       recommendedPrice,
       sellPricePerKg,
       grossProfitPerKg,
@@ -178,15 +250,19 @@ export default function App() {
       breakEvenKg,
       breakEvenRevenue,
     };
-  }, [beans, fixedCosts, monthlyKg, monthlyMode, monthlyRevenue, ratioOk, roastLoss, salesFeeRate, sellPriceInput, targetMargin, totalRatio, variablePerKg]);
+  }, [activeCostTargetId, beans, costTargets, fixedCosts, monthlyKg, monthlyMode, monthlyRevenue, packagingPerKg, pricingMode, ratioOk, roastLoss, salesFeeRate, sellPriceInput, targetMargin, totalRatio, variablePerKg]);
 
   const makeEntry = (name) => ({
     id: uid(),
     name,
     savedAt: new Date().toLocaleString("ko-KR"),
     beans: beans.map((b) => ({ ...b })),
+    pricingMode,
     roastLoss,
     targetMargin,
+    packagingPerKg,
+    costTargets,
+    activeCostTargetId: sim?.activeCostTarget?.id || activeCostTargetId,
     sellPriceInput,
     monthlyMode,
     monthlyKg,
@@ -212,8 +288,12 @@ export default function App() {
   const loadBlend = (entry) => {
     const item = normalizeSaved(entry);
     setBeans(item.beans.map(normalizeBean));
+    setPricingMode(item.pricingMode);
     setRoastLoss(item.roastLoss);
     setTargetMargin(item.targetMargin);
+    setPackagingPerKg(item.packagingPerKg);
+    setCostTargets(item.costTargets);
+    setActiveCostTargetId(item.activeCostTargetId || item.costTargets[0]?.id || "");
     setSellPriceInput(item.sellPriceInput);
     setMonthlyMode(item.monthlyMode);
     setMonthlyKg(item.monthlyKg);
@@ -443,22 +523,90 @@ export default function App() {
 
               {beans.length < 6 && <button className="btn" onClick={addBean} style={{ marginTop: 10 }}>+ 생두 추가</button>}
 
-              <div className="step-lbl">STEP 02 · kg당 마진</div>
+              <div className="step-lbl">STEP 02 · 판매가 기준</div>
               <div className="card">
                 <div className="grid-3">
                   <div>
-                    <div className="lbl">로스팅 손실률</div>
-                    <input type="number" value={roastLoss} min={0} max={80} step={1} onChange={(e) => setRoastLoss(inputNumber(e.target.value, 0, 80))} />
+                    <div className="lbl">가격 계산 방식</div>
+                    <div className="seg">
+                      <button className={`seg-btn ${pricingMode === "margin" ? "on" : "off"}`} onClick={() => setPricingMode("margin")}>마진율</button>
+                      <button className={`seg-btn ${pricingMode === "costRate" ? "on" : "off"}`} onClick={() => setPricingMode("costRate")}>원가율</button>
+                    </div>
                   </div>
                   <div>
-                    <div className="lbl">목표 마진율</div>
-                    <input type="number" value={targetMargin} min={0} max={95} step={1} onChange={(e) => setTargetMargin(inputNumber(e.target.value, 0, 95))} />
+                    <div className="lbl">로스팅 손실률</div>
+                    <input type="number" value={roastLoss} min={0} max={80} step={1} onChange={(e) => setRoastLoss(inputNumber(e.target.value, 0, 80))} />
                   </div>
                   <div>
                     <div className="lbl">실제 판매가 / kg</div>
                     <input type="number" value={sellPriceInput} min={0} step={100} onChange={(e) => setSellPriceInput(e.target.value)} placeholder="비우면 추천가 사용" />
                   </div>
                 </div>
+
+                {pricingMode === "margin" ? (
+                  <div className="grid-2" style={{ marginTop: 10 }}>
+                    <div>
+                      <div className="lbl">목표 마진율</div>
+                      <input type="number" value={targetMargin} min={0} max={95} step={1} onChange={(e) => setTargetMargin(inputNumber(e.target.value, 0, 95))} />
+                    </div>
+                    <div className="tiny" style={{ display: "flex", alignItems: "end", paddingBottom: 7 }}>
+                      판매가 = 로스팅 후 원가 ÷ (1 - 목표 마진율)
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid-2" style={{ marginTop: 10 }}>
+                      <div>
+                        <div className="lbl">포장재/기타 원가 / kg</div>
+                        <input type="number" value={packagingPerKg} min={0} step={100} onChange={(e) => setPackagingPerKg(inputNumber(e.target.value, 0, 9999999))} />
+                      </div>
+                      <div className="tiny" style={{ display: "flex", alignItems: "end", paddingBottom: 7 }}>
+                        판매가 = (로스팅 후 원가 + 기타 원가) × 용량 ÷ 목표 원가율, 100원 단위 올림
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 12 }}>
+                      {costTargets.map((target) => {
+                        const result = sim?.costRateRows.find((row) => row.id === target.id);
+                        const active = (sim?.activeCostTarget?.id || activeCostTargetId) === target.id;
+                        return (
+                          <div key={target.id} className="card" style={{ padding: 12, borderColor: active ? "#c8a96e" : "#222", background: active ? "#17130c" : "#141414" }}>
+                            <div className="grid-4">
+                              <div>
+                                <div className="lbl">구분</div>
+                                <input type="text" value={target.channel} onChange={(e) => updateCostTarget(target.id, { channel: e.target.value })} />
+                              </div>
+                              <div>
+                                <div className="lbl">용량 kg</div>
+                                <input type="number" value={target.sizeKg} min={0.01} step={0.01} onChange={(e) => updateCostTarget(target.id, { sizeKg: inputNumber(e.target.value, 0.01, 999) })} />
+                              </div>
+                              <div>
+                                <div className="lbl">목표 원가율 %</div>
+                                <input type="number" value={target.targetCostRate} min={1} max={99} step={1} onChange={(e) => updateCostTarget(target.id, { targetCostRate: inputNumber(e.target.value, 1, 99) })} />
+                              </div>
+                              <div>
+                                <div className="lbl">추천 판매가</div>
+                                <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                                  <button className={active ? "btn-primary" : "btn"} onClick={() => setActiveCostTargetId(target.id)} style={{ flex: 1 }}>
+                                    {money(result?.recommended || 0)}
+                                  </button>
+                                  <button className="btn-del" onClick={() => removeCostTarget(target.id)}>✕</button>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="grid-4" style={{ marginTop: 8 }}>
+                              <div className="tiny">100g당 {money(result?.per100g || 0)}</div>
+                              <div className="tiny">원가 {money(result?.cost || 0)}</div>
+                              <div className="tiny">실제 원가율 {pct(result?.actualCostRate || 0)}</div>
+                              <div className="tiny">마진액 {money(result?.marginAmount || 0)}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <button className="btn" onClick={addCostTarget} style={{ marginTop: 10 }}>+ 원가율 행 추가</button>
+                  </>
+                )}
               </div>
 
               {sim && (
@@ -473,8 +621,13 @@ export default function App() {
                       <div className="value">{money(sim.roastedCostPerKg)}</div>
                     </div>
                     <div className="metric">
-                      <div className="lbl">추천 판매가 / kg</div>
+                      <div className="lbl">{pricingMode === "costRate" ? "선택 판매가 / kg 환산" : "추천 판매가 / kg"}</div>
                       <div className="value gold">{money(sim.recommendedPrice)}</div>
+                      {pricingMode === "costRate" && sim.activeCostTarget && (
+                        <div className="tiny">
+                          {sim.activeCostTarget.channel} {sim.activeCostTarget.sizeKg}kg {money(sim.activeCostTarget.recommended)}
+                        </div>
+                      )}
                     </div>
                     <div className="metric">
                       <div className="lbl">kg당 이익 / 마진</div>
